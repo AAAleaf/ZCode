@@ -1,0 +1,228 @@
+name: Build & Bundle
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dist_base_url:
+        description: "ZCODE_DIST_BASE_URL — CLI 安装脚本的下载根地址（发布时必填）"
+        required: false
+        default: ""
+      build_cli:
+        description: "构建 CLI 发行包 (zcode tar.gz)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      build_desktop:
+        description: "构建桌面 Electron 应用（矩阵：macOS / Windows / Linux）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      create_release:
+        description: "推送到 tag 或手动触发时创建 GitHub Release"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "true"
+          - "false"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # 公共：安装依赖 + bootstrap
+  # ============================================================
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+          cache: "pnpm"
+
+      - name: Install pnpm 10.33.2
+        run: corepack enable && corepack prepare pnpm@10.33.2 --activate && pnpm -v
+
+      - name: Bootstrap
+        run: pnpm bootstrap
+
+      - name: Read version
+        id: meta
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # 依赖层复用给 CLI job，避免重复 install
+      - name: Upload bootstrap layer
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-layer
+          path: |
+            node_modules
+            packages/*/node_modules
+            apps/zcode-cli/node_modules
+          if-no-files-found: error
+          retention-days: 1
+
+  # ============================================================
+  # CLI 发行包（任一 runner 都能产出同一套 tar.gz）
+  # ============================================================
+  cli:
+    name: CLI Tarball
+    if: inputs.build_cli != 'false'
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+          cache: "pnpm"
+
+      - name: Install pnpm 10.33.2
+        run: corepack enable && corepack prepare pnpm@10.33.2 --activate
+
+      - name: Restore bootstrap layer
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-layer
+
+      - name: Build CLI
+        env:
+          ZCODE_DIST_BASE_URL: ${{ inputs.dist_base_url }}
+        run: pnpm build:zcode --base-url "${ZCODE_DIST_BASE_URL:-https://example.com/zcode/}"
+
+      - name: Show outputs
+        run: ls -R dist/zcode | head -60
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-cli
+          path: |
+            dist/zcode/latest.json
+            dist/zcode/install.sh
+            dist/zcode/releases/*/zcode-*.tar.gz
+            dist/zcode/releases/*/sha256.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  # ============================================================
+  # 桌面端（跨平台矩阵，每个平台用对应 runner）
+  # ============================================================
+  desktop:
+    name: Desktop (${{ matrix.label }})
+    if: inputs.build_desktop != 'false'
+    needs: setup
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS ARM64
+            runner: macos-latest
+            os: mac
+            arch: arm64
+          - label: macOS x64
+            runner: macos-13
+            os: mac
+            arch: x64
+          - label: Windows x64
+            runner: windows-latest
+            os: win
+            arch: x64
+          - label: Linux x64
+            runner: ubuntu-22.04
+            os: linux
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+          cache: "pnpm"
+
+      - name: Install pnpm 10.33.2
+        run: corepack enable && corepack prepare pnpm@10.33.2 --activate
+
+      - name: (mac/Linux) Set Electron mirror
+        if: runner.os != 'Windows'
+        run: echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" >> "$GITHUB_ENV"
+
+      - name: (Windows) Set Electron mirror
+        if: runner.os == 'Windows'
+        run: echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Bootstrap + Bundle
+        run: |
+          pnpm bootstrap
+          pnpm bundle:desktop -- --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+
+      - name: Show outputs
+        shell: bash
+        run: ls -lh packages/desktop/dist/ | head -40
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            packages/desktop/dist/*.dmg
+            packages/desktop/dist/*.zip
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.AppImage
+            packages/desktop/dist/*.deb
+            packages/desktop/dist/*.rpm
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ============================================================
+  # 打 tag 时自动发 GitHub Release
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [setup, cli, desktop]
+    if: |
+      !cancelled() && (
+        startsWith(github.ref, 'refs/tags/v')
+        || inputs.create_release == 'true'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.setup.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('ZCode {0}', needs.setup.outputs.version) }}
+          generate_release_notes: true
+          files: |
+            artifacts/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

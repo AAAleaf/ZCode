@@ -1,4 +1,4 @@
-name: Build & Bundle
+name: Build Windows Desktop
 
 on:
   push:
@@ -6,26 +6,6 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      dist_base_url:
-        description: "ZCODE_DIST_BASE_URL — CLI 安装脚本的下载根地址（发布时必填）"
-        required: false
-        default: ""
-      build_cli:
-        description: "构建 CLI 发行包 (zcode tar.gz)"
-        required: false
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-      build_desktop:
-        description: "构建桌面 Electron 应用（矩阵：macOS / Windows / Linux）"
-        required: false
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
       create_release:
         description: "推送到 tag 或手动触发时创建 GitHub Release"
         required: false
@@ -37,16 +17,18 @@ on:
           - "false"
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: win-build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ZCODE_ENV: production
+  ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
+
 jobs:
-  # ============================================================
-  # 公共：安装依赖 + bootstrap
-  # ============================================================
-  setup:
-    name: Setup
-    runs-on: ubuntu-latest
+  win-desktop:
+    name: Windows Desktop x64
+    runs-on: windows-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
@@ -70,153 +52,33 @@ jobs:
           npm -v
           pnpm -v
 
-      - name: Bootstrap
-        run: pnpm bootstrap
-
       - name: Read version
         id: meta
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      # 依赖层复用给 CLI job，避免重复 install
-      - name: Upload bootstrap layer
-        uses: actions/upload-artifact@v4
-        with:
-          name: bootstrap-layer
-          path: |
-            node_modules
-            packages/*/node_modules
-            apps/zcode-cli/node_modules
-          if-no-files-found: error
-          retention-days: 1
-
-  # ============================================================
-  # CLI 发行包（任一 runner 都能产出同一套 tar.gz）
-  # ============================================================
-  cli:
-    name: CLI Tarball
-    if: inputs.build_cli != 'false'
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup pnpm 10.33.2
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.2
-          run_install: false
-
-      - name: Setup Node.js 24.14.0
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24.14.0"
-          cache: "pnpm"
-
-      - name: Restore bootstrap layer
-        uses: actions/download-artifact@v4
-        with:
-          name: bootstrap-layer
-
-      - name: Build CLI
+      - name: Bootstrap + Bundle (production backend)
         env:
-          ZCODE_DIST_BASE_URL: ${{ inputs.dist_base_url }}
-        run: pnpm build:zcode --base-url "${ZCODE_DIST_BASE_URL:-https://example.com/zcode/}"
-
-      - name: Show outputs
-        run: ls -R dist/zcode | head -60
-
-      - name: Upload CLI artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: zcode-cli
-          path: |
-            dist/zcode/latest.json
-            dist/zcode/install.sh
-            dist/zcode/releases/*/zcode-*.tar.gz
-            dist/zcode/releases/*/sha256.txt
-          if-no-files-found: error
-          retention-days: 14
-
-  # ============================================================
-  # 桌面端（跨平台矩阵，每个平台用对应 runner）
-  # ============================================================
-  desktop:
-    name: Desktop (${{ matrix.label }})
-    if: inputs.build_desktop != 'false'
-    needs: setup
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: macOS ARM64
-            runner: macos-latest
-            os: mac
-            arch: arm64
-          - label: macOS x64
-            runner: macos-13
-            os: mac
-            arch: x64
-          - label: Windows x64
-            runner: windows-latest
-            os: win
-            arch: x64
-          - label: Linux x64
-            runner: ubuntu-22.04
-            os: linux
-            arch: x64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup pnpm 10.33.2
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.2
-          run_install: false
-
-      - name: Setup Node.js 24.14.0
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24.14.0"
-          cache: "pnpm"
-
-      - name: (mac/Linux) Set Electron mirror
-        if: runner.os != 'Windows'
-        run: echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" >> "$GITHUB_ENV"
-
-      - name: (Windows) Set Electron mirror
-        if: runner.os == 'Windows'
-        run: echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Bootstrap + Bundle
+          ZCODE_ENV: production
         run: |
           pnpm bootstrap
-          pnpm bundle:desktop -- --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+          pnpm bundle:desktop -- --os win --arch x64
 
       - name: Show outputs
         shell: bash
         run: ls -lh packages/desktop/dist/ | head -40
 
-      - name: Upload desktop artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zcode-desktop-${{ matrix.os }}-${{ matrix.arch }}
+          name: zcode-desktop-win-x64
           path: |
-            packages/desktop/dist/*.dmg
-            packages/desktop/dist/*.zip
             packages/desktop/dist/*.exe
-            packages/desktop/dist/*.AppImage
-            packages/desktop/dist/*.deb
-            packages/desktop/dist/*.rpm
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
-  # ============================================================
-  # 打 tag 时自动发 GitHub Release
-  # ============================================================
   release:
     name: Create GitHub Release
-    needs: [setup, cli, desktop]
+    needs: win-desktop
     if: |
       !cancelled() && (
         startsWith(github.ref, 'refs/tags/v')
@@ -234,8 +96,17 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.setup.outputs.version) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('ZCode {0}', needs.setup.outputs.version) }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.win-desktop.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('ZCode {0} (Windows)', needs.win-desktop.outputs.version) }}
+          body: |
+            ## ZCode v${{ needs.win-desktop.outputs.version }} — Windows x64
+
+            **本次 CI 使用生产后端（`ZCODE_ENV=production`）构建。**
+
+            ### SmartScreen 告警说明
+            右键 exe → 属性 → 勾选"解除锁定"（如果存在），或在 SmartScreen 弹窗点 **"更多信息 → 仍要运行"**。
+
+            > 没有 EV 代码签名证书（需要购买），SmartScreen 会提示一次警告。
           generate_release_notes: true
           files: |
             artifacts/**
